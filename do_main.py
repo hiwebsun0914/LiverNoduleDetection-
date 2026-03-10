@@ -14,7 +14,6 @@ from feeder_8modal_7class import MRIDataset
 from model.crossatten import generate_crossatten
 from model.ablation.Rnet import generate_rnet
 from model.ablation.PA_Net import generate_panet
-print("===========================================================================")    
 # IA_Net -> crossatten
 from model.fuxian.MIL.deepganet import generate_deepganet
 from model.fuxian.MIL.DAMIDL8m_semi import DAMIDL
@@ -41,6 +40,7 @@ import matplotlib.pyplot as plt
 from sklearn import metrics
 import warnings
 warnings.filterwarnings("ignore")
+from tqdm.auto import tqdm
 
 from torch.utils.tensorboard import SummaryWriter 
 
@@ -64,138 +64,118 @@ def str_to_bool(value):
 #######################loss-based attention(P/I weight)################
 def rampup(global_step, rampup_length=24):
     if global_step <rampup_length:
-        global_step = np.float(global_step)
-        rampup_length = np.float(rampup_length)
+        global_step = float(global_step)
+        rampup_length = float(rampup_length)
         phase = 1.0 - np.maximum(0.0, global_step) / rampup_length
     else:
         phase = 0.0
     return np.exp(-5.0 * phase * phase)
 
-def train(train_loader, model, lossCE, loss_patch, optimizer,args):
-    
+
+def format_duration(seconds):
+    return str(datetime.timedelta(seconds=int(max(0, seconds))))
+
+def train(train_loader, model, lossCE, loss_patch, optimizer, scaler, args, epoch_idx):
     start = time.time()
     model.train()
-    train_loss = 0
-    correct = 0
-    train_pre = 0
-    train_rec = 0
-    train_f1 = 0
+    train_loss = 0.0
+    correct = 0.0
+    seen = 0
+    train_pre = 0.0
+    train_rec = 0.0
+    train_f1 = 0.0
 
-    rampup_value = rampup(epoch)
+    rampup_value = rampup(epoch_idx)
+    u_w = 0 if epoch_idx == 0 else 0.2 * rampup_value
+    u_w = torch.tensor([u_w], dtype=torch.float32, device=device_now, requires_grad=False)
 
-    if epoch==0:
-        u_w = 0
-    else:
-        u_w = 0.2*rampup_value
+    train_pbar = tqdm(
+        enumerate(train_loader, start=1),
+        total=len(train_loader),
+        desc=f"Train {epoch_idx + 1}/{args.num_epoch}",
+        leave=False,
+    )
 
-    u_w = torch.autograd.Variable(torch.FloatTensor([u_w]).cuda(), requires_grad=False) 
+    for step, (images_t2, images_dwi, images_in, images_out, images_pre, images_ap, images_pvp, images_dp, label) in train_pbar:
+        images_t2, images_dwi, images_in, images_out, images_pre, images_ap, images_pvp, images_dp, labels = images_t2.to(device_now,non_blocking=True), images_dwi.to(device_now,non_blocking=True), images_in.to(device_now,non_blocking=True), images_out.to(device_now,non_blocking=True), images_pre.to(device_now,non_blocking=True), images_ap.to(device_now,non_blocking=True), images_pvp.to(device_now,non_blocking=True), images_dp.to(device_now,non_blocking=True), label.to(device_now,non_blocking=True)
 
-    for images_t2, images_dwi, images_in, images_out, images_pre, images_ap, images_pvp, images_dp, label in train_loader:
-        
-        if args.cuda:
-
-            images_t2, images_dwi, images_in, images_out, images_pre, images_ap, images_pvp, images_dp, labels = images_t2.to(device_now,non_blocking=True), images_dwi.to(device_now,non_blocking=True), images_in.to(device_now,non_blocking=True), images_out.to(device_now,non_blocking=True), images_pre.to(device_now,non_blocking=True), images_ap.to(device_now,non_blocking=True), images_pvp.to(device_now,non_blocking=True), images_dp.to(device_now,non_blocking=True), label.to(device_now,non_blocking=True)
-
-        #######################cross atten################
-        bag_preds, out1, f_compose, alpha_compose, out2, f_patch_com, alpha_patch_com = model(images_t2.to(torch.float32),images_dwi.to(torch.float32), images_in.to(torch.float32), images_out.to(torch.float32), images_pre.to(torch.float32), images_ap.to(torch.float32), images_pvp.to(torch.float32), images_dp.to(torch.float32))      #(patch_num,C=1,H,W,D)
-
-
-        loss_1 = lossCE(bag_preds, labels.long())
-
-        loss_2_R = loss_patch(f_compose, labels.repeat(4*4,1).permute(1,0).contiguous().view(-1), weights= alpha_compose.view(-1))
-        loss_2_R_alphapatchcom = loss_patch(f_compose, labels.repeat(4*4,1).permute(1,0).contiguous().view(-1), weights= alpha_patch_com.view(-1))
-        loss_2_P_alphacom = loss_patch(f_patch_com, labels.repeat(4*4,1).permute(1,0).contiguous().view(-1), weights=alpha_compose.view(-1))
-        loss_2_P = loss_patch(f_patch_com, labels.repeat(4*4,1).permute(1,0).contiguous().view(-1), weights=alpha_patch_com.view(-1))
-
-
-        ############+sim_loss##########
-        simlabel = torch.ones(alpha_compose.shape[0]).to(device_now)
-        sim_loss = torch.nn.CosineEmbeddingLoss()(alpha_compose,alpha_patch_com,simlabel)
-        
-        loss = loss_1 + u_w*loss_2_P/bag_preds.size(0) + u_w*loss_2_R/bag_preds.size(0) + 0.25*u_w* loss_2_R_alphapatchcom +  0.25*u_w* loss_2_P_alphacom + 0.25* sim_loss  
-        # loss = loss_1 + u_w*loss_2_R/bag_preds.size(0) + u_w*loss_2_R/bag_preds.size(0)   #without cross-attention
+        optimizer.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=(args.amp and device_now.type == "cuda")):
+            bag_preds, out1, f_compose, alpha_compose, out2, f_patch_com, alpha_patch_com = model(images_t2.to(torch.float32),images_dwi.to(torch.float32), images_in.to(torch.float32), images_out.to(torch.float32), images_pre.to(torch.float32), images_ap.to(torch.float32), images_pvp.to(torch.float32), images_dp.to(torch.float32))
+            loss_1 = lossCE(bag_preds, labels.long())
+            patch_targets = labels.repeat(4*4,1).permute(1,0).contiguous().view(-1)
+            loss_2_R = loss_patch(f_compose, patch_targets, weights=alpha_compose.view(-1))
+            loss_2_R_alphapatchcom = loss_patch(f_compose, patch_targets, weights=alpha_patch_com.view(-1))
+            loss_2_P_alphacom = loss_patch(f_patch_com, patch_targets, weights=alpha_compose.view(-1))
+            loss_2_P = loss_patch(f_patch_com, patch_targets, weights=alpha_patch_com.view(-1))
+            simlabel = torch.ones(alpha_compose.shape[0], device=device_now)
+            sim_loss = torch.nn.CosineEmbeddingLoss()(alpha_compose,alpha_patch_com,simlabel)
+            loss = loss_1 + u_w*loss_2_P/bag_preds.size(0) + u_w*loss_2_R/bag_preds.size(0) + 0.25*u_w*loss_2_R_alphapatchcom + 0.25*u_w*loss_2_P_alphacom + 0.25*sim_loss
 
         _, predicted = torch.max(bag_preds.data, 1)
-
         correct += predicted.eq(labels).sum().float().item()
-        train_pre += metrics.precision_score(labels.tolist(), predicted.tolist(),average='micro')
-        train_rec += metrics.recall_score(labels.tolist(), predicted.tolist(),average='micro')
-        train_f1 += metrics.f1_score(labels.tolist(), predicted.tolist(),average='micro')
+        seen += labels.size(0)
+        labels_cpu = labels.detach().cpu()
+        predicted_cpu = predicted.detach().cpu()
+        train_pre += metrics.precision_score(labels_cpu.tolist(), predicted_cpu.tolist(), average='micro')
+        train_rec += metrics.recall_score(labels_cpu.tolist(), predicted_cpu.tolist(), average='micro')
+        train_f1 += metrics.f1_score(labels_cpu.tolist(), predicted_cpu.tolist(), average='micro')
 
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         train_loss += loss.item()
-    
+        train_pbar.set_postfix(loss=f"{(train_loss / step):.4f}", acc=f"{(correct / seen):.4f}")
 
-
-    finish = time.time()
-    print('Train set: Epoch: {}, len(train_loader.dataset)): {}, Train_Accuracy: {}, Average loss: {:.4f}, Precision Score: {:.4f}, Recall Score :{:.4f}, F1 Score: {:.4f}, Time consumed:{:.2f}s'.format(
-    epoch,
-    len(train_loader.dataset),
-    int(correct) / len(train_loader.dataset),
-    train_loss / len(train_loader),
-    train_pre / len(train_loader),
-    train_rec / len(train_loader),
-    train_f1 / len(train_loader),
-    finish - start
-))
-
+    train_loss = train_loss / len(train_loader)
     train_acc = correct / len(train_loader.dataset)
     train_f1 = train_f1 / len(train_loader)
+    return train_loss, train_acc, train_f1, time.time() - start
 
-    return train_loss, train_acc, train_f1
 
-
-def validate(val_loader, model, lossCE, loss_patch, optimizer,args):
-
+def validate(val_loader, model, lossCE, args, epoch_idx):
     start = time.time()
     model.eval()
 
     val_loss = 0.0
     correct = 0.0
+    seen = 0
     test_pre = 0.0
-    test_rec =0.0
+    test_rec = 0.0
     val_f1 = 0.0
 
-    for (images_t2, images_dwi, images_in, images_out, images_pre, images_ap, images_pvp, images_dp, labels) in val_loader:
+    val_pbar = tqdm(
+        enumerate(val_loader, start=1),
+        total=len(val_loader),
+        desc=f"Val   {epoch_idx + 1}/{args.num_epoch}",
+        leave=False,
+    )
 
-        if args.cuda:
+    with torch.no_grad():
+        for step, (images_t2, images_dwi, images_in, images_out, images_pre, images_ap, images_pvp, images_dp, labels) in val_pbar:
             images_t2, images_dwi, images_in, images_out, images_pre, images_ap, images_pvp, images_dp, labels = images_t2.to(device_now,non_blocking=True), images_dwi.to(device_now,non_blocking=True), images_in.to(device_now,non_blocking=True), images_out.to(device_now,non_blocking=True), images_pre.to(device_now,non_blocking=True), images_ap.to(device_now,non_blocking=True), images_pvp.to(device_now,non_blocking=True), images_dp.to(device_now,non_blocking=True), labels.to(device_now,non_blocking=True)
 
-        outputs,_,_,_,_,_,_ = model(images_t2.to(torch.float32),images_dwi.to(torch.float32), images_in.to(torch.float32), images_out.to(torch.float32), images_pre.to(torch.float32), images_ap.to(torch.float32), images_pvp.to(torch.float32), images_dp.to(torch.float32))    #(patch_num,C=1,H,W,D)
+            with torch.cuda.amp.autocast(enabled=(args.amp and device_now.type == "cuda")):
+                outputs,_,_,_,_,_,_ = model(images_t2.to(torch.float32),images_dwi.to(torch.float32), images_in.to(torch.float32), images_out.to(torch.float32), images_pre.to(torch.float32), images_ap.to(torch.float32), images_pvp.to(torch.float32), images_dp.to(torch.float32))
+                loss = lossCE(outputs, labels.long())
 
-        loss = lossCE(outputs, labels.long())
+            val_loss += loss.item()
+            _, preds = outputs.max(1)
+            correct += preds.eq(labels).sum().float().item()
+            seen += labels.size(0)
 
-        val_loss += loss.item()
-        _, preds = outputs.max(1)
-        correct += preds.eq(labels).sum().float().item()
+            labels_cpu = labels.detach().cpu()
+            preds_cpu = preds.detach().cpu()
+            test_pre += metrics.precision_score(labels_cpu.tolist(), preds_cpu.tolist(), average='micro')
+            test_rec += metrics.recall_score(labels_cpu.tolist(), preds_cpu.tolist(), average='micro')
+            val_f1 += metrics.f1_score(labels_cpu.tolist(), preds_cpu.tolist(), average='micro')
+            val_pbar.set_postfix(loss=f"{(val_loss / step):.4f}", acc=f"{(correct / seen):.4f}")
 
-        test_pre += metrics.precision_score(labels.tolist(), preds.tolist(),average='micro')
-        test_rec += metrics.recall_score(labels.tolist(), preds.tolist(),average='micro')
-        val_f1 += metrics.f1_score(labels.tolist(), preds.tolist(),average='micro')
-
-
-
-    finish = time.time()
-
-    print('Evaluating Network.....')
-    print('Test set: Epoch: {}, len(val_loader.dataset)): {}, Val_ACC: {}, Average loss: {:.4f}, Precision Score: {:.4f}, Recall Score :{:.4f}, F1 Score: {:.4f}, Time consumed:{:.2f}s'.format(
-        epoch,
-        len(val_loader.dataset),
-        correct / len(val_loader.dataset),
-        val_loss / len(val_loader),
-        test_pre/ len(val_loader),
-        test_rec/ len(val_loader),
-        val_f1 / len(val_loader),
-        finish - start
-    ))
+    val_loss = val_loss / len(val_loader)
     val_acc = correct / len(val_loader.dataset)
     val_f1 = val_f1 / len(val_loader)
-
-    return val_loss, val_acc, val_f1
+    return val_loss, val_acc, val_f1, time.time() - start
 
 
 if __name__ == '__main__':
@@ -247,55 +227,38 @@ if __name__ == '__main__':
     
     parser.add_argument('--n_fold', type=str, default='5fold', 
                         help='1fold/5fold')
+    parser.add_argument('--amp', type=str_to_bool, default=True,
+                        help='enable mixed precision training to reduce GPU memory')
     args = parser.parse_args()
-    
-    exp_info = vars(args)
-    print("exp_info:", exp_info)
+    device_now = torch.device("cuda" if (args.cuda and torch.cuda.is_available()) else "cpu")
+    print("device_now:", device_now)
+    print(
+        f"config: net={args.net} fold={args.n_fold} bs={args.batch_size} "
+        f"epochs={args.num_epoch} lr={args.lr} resume={args.resume} amp={args.amp}"
+    )
 
     writer = SummaryWriter(log_dir=syspath+"/log/"+starttime[:10]+"/"+starttime[11:],flush_secs=60)
+    os.makedirs(args.result_dir, exist_ok=True)
+
+    last_ckpt_path = os.path.join(args.result_dir, "last.pth")
+    best_ckpt_path = os.path.join(args.result_dir, "best.pth")
 
     if args.net == "Rbase":
         model = generate_rnet(10)
-        print("batch_size=",args.batch_size)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
-        print("resnet 3d baseline:","generate_resbase")
 
 
 
     elif args.net =="deepganet":
         model = generate_deepganet(18)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
-        print("deepganet:,patch_num=16")
     elif args.net =="DAMIDL":
         model = DAMIDL(patch_num=4, feature_depth=None, num_classes=7)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
-        print("DAMIDL:,patch_num=16,batch_size =4")
 
     elif args.net == "3dres":
         model = generate_crossatten(10)
-        print("batch_size=",args.batch_size)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
-        print("3dres net as baseline:","generate_model")
- 
-        if args.resume:
-            print("Load the best.pt model",args.weight_path)
-            checkpoint = torch.load(args.weight_path)
-            raw_epoch = checkpoint['epoch']
-            model.load_state_dict(checkpoint['model'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            # model.load_state_dict(checkpoint, strict=False)
-
-
-            for state in optimizer.state.values():
-                for k, v in state.items():
-                    if torch.is_tensor(v):
-                        state[k] = v.cuda()
-            best_f1 = checkpoint['best_f1']
-            best_acc = checkpoint['best_acc']
-            model.eval()
-            print("------Load - Model -Done!------Have - Pretrain:",raw_epoch,"epochs")
-
-    print("NOT PARALLEL!!!")
 
     model = model.to(device_now,non_blocking=True)
 
@@ -306,6 +269,7 @@ if __name__ == '__main__':
     lossCE= MultiCEFocalLoss(class_num=7,device_now=device_now)
     #######################loss-based attention###############
     loss_patch = WeightCE(aggregate='sum',device_now=device_now)
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device_now.type == "cuda"))
 
     train_dataset = MRIDataset(args, flag='Train')
     val_dataset = MRIDataset(args, flag='Val')
@@ -313,17 +277,40 @@ if __name__ == '__main__':
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,num_workers=6, worker_init_fn=np.random.seed(seed),pin_memory=True)   #worker_init_fn=np.random.seed(seed)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,num_workers=6,worker_init_fn=np.random.seed(seed),pin_memory=True)       #worker_init_fn = worker_init_fn(42),
   
+    start_epoch = 0
     best_epoch = 0
     best_acc = 0.0
     best_f1 = 0.0
+    best_acc_f1 = 0.0
 
-    for epoch in range(0, args.num_epoch):
-        
+    if args.resume:
+        resume_path = args.weight_path if args.weight_path else last_ckpt_path
+        if not os.path.isfile(resume_path):
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device_now)
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'scheduler' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler'])
+        if 'scaler' in checkpoint and checkpoint['scaler'] is not None:
+            scaler.load_state_dict(checkpoint['scaler'])
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(device_now)
+        start_epoch = checkpoint.get('epoch', 0)
+        best_epoch = checkpoint.get('best_epoch', 0)
+        best_acc = checkpoint.get('best_acc', 0.0)
+        best_f1 = checkpoint.get('best_f1', 0.0)
+        best_acc_f1 = checkpoint.get('best_acc_f1', 0.0)
+        print(f"Resume from epoch {start_epoch}/{args.num_epoch}, best_acc={best_acc:.4f}")
+
+    train_wall_start = time.time()
+    epochs_pbar = tqdm(range(start_epoch, args.num_epoch), desc="Epochs", unit="epoch")
+    for epoch in epochs_pbar:
         scheduler.step()
-        
-        print("lr of epoch", epoch, "=>", scheduler.get_last_lr())
-        train_loss, train_acc, train_f1 = train(train_loader, model, lossCE, loss_patch, optimizer,args)
-        val_loss, val_acc, val_f1 = validate(val_loader, model, lossCE, loss_patch, optimizer,args)
+        train_loss, train_acc, train_f1, train_sec = train(train_loader, model, lossCE, loss_patch, optimizer, scaler, args, epoch)
+        val_loss, val_acc, val_f1, val_sec = validate(val_loader, model, lossCE, args, epoch)
 
         writer.add_scalar('train/train_loss', train_loss, epoch)
         writer.add_scalar('train/train_acc', train_acc, epoch)
@@ -334,23 +321,48 @@ if __name__ == '__main__':
 
         if val_f1 > best_f1:
             best_f1 = val_f1
-        if val_acc > best_acc:
+        is_new_best = val_acc > best_acc
+        if is_new_best:
             best_acc = val_acc
             best_acc_f1 = val_f1
             best_epoch = epoch + 1
-            torch.save({
-                'epoch': best_epoch,
-                'model': model.state_dict(), 
-                'best_acc': best_acc,
-                'best_f1': val_f1,
-                'optimizer': optimizer.state_dict(),
-                },
-                os.path.join(args.result_dir.format(model), starttime[:19] +'.pth'))
-    print("Starttime:",starttime)
-    print("best_epoch",best_epoch)
-    print("best_acc",best_acc)
-    print("best_f1",best_f1)
-    print("best_acc_f1",best_acc_f1)
+
+        ckpt = {
+            'epoch': epoch + 1,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'scaler': scaler.state_dict() if scaler.is_enabled() else None,
+            'best_epoch': best_epoch,
+            'best_acc': best_acc,
+            'best_f1': best_f1,
+            'best_acc_f1': best_acc_f1,
+            'args': vars(args),
+            'starttime': starttime,
+        }
+        torch.save(ckpt, last_ckpt_path)
+        if is_new_best:
+            torch.save(ckpt, best_ckpt_path)
+
+        epochs_done = epoch - start_epoch + 1
+        elapsed = time.time() - train_wall_start
+        avg_epoch = elapsed / max(1, epochs_done)
+        remaining_epochs = args.num_epoch - (epoch + 1)
+        eta = format_duration(remaining_epochs * avg_epoch)
+        epochs_pbar.set_postfix(train_acc=f"{train_acc:.4f}", val_acc=f"{val_acc:.4f}", eta=eta)
+
+        print(
+            f"Epoch {epoch + 1}/{args.num_epoch} | "
+            f"train_loss {train_loss:.4f} acc {train_acc:.4f} | "
+            f"val_loss {val_loss:.4f} acc {val_acc:.4f} | "
+            f"best_acc {best_acc:.4f} | eta {eta}"
+        )
+
+    print(
+        f"Done | best_epoch {best_epoch} | best_acc {best_acc:.4f} | "
+        f"best_f1 {best_f1:.4f} | best_acc_f1 {best_acc_f1:.4f}"
+    )
+    writer.close()
 
 
     eval_metrics = {'Starttime': starttime, 

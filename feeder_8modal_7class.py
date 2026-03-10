@@ -1,12 +1,19 @@
-from monai.utils import GridSampleMode, GridSamplePadMode,InterpolateMode,NumpyPadMode
-from monai.transforms import RandGaussianNoise, SqueezeDim, Rand3DElastic, RandGaussianSmooth, RandZoom, RandAffine, LoadImage, AddChannel, ToTensor, Resize, NormalizeIntensity, RandRotate90, RandFlip
-from monai.transforms import Compose, SpatialCropd, CenterSpatialCropd, RandSpatialCropd, Rand3DElasticd, RandGaussianNoised, SqueezeDimd, \
-                             LoadImaged, AddChanneld, EnsureChannelFirstd, ToTensord, Resized, NormalizeIntensityd, \
-                             RandRotate90d, RandFlipd, ConcatItemsd, RandZoomd, RandGaussianSmoothd, AdjustContrastd,RandAdjustContrastd,\
-                             RandAffined, ScaleIntensityd, RandSpatialCropSamplesd,RandRotated,ScaleIntensityRanged,RandScaleCropd,RandSpatialCropd
+from monai.utils import GridSampleMode, GridSamplePadMode
+from monai.transforms import (
+    Compose,
+    EnsureChannelFirstd,
+    LoadImaged,
+    NormalizeIntensityd,
+    RandFlipd,
+    RandRotated,
+    Resized,
+    ToTensord,
+)
 import numpy as np
 import monai
 import os
+import json
+from pathlib import Path
 
 
 class MRIDataset(monai.data.Dataset):     #train/test
@@ -18,6 +25,7 @@ class MRIDataset(monai.data.Dataset):     #train/test
         self.csv_path = args.csv_path
         self.data_dir = args.data_dir
         self.flag = flag    
+        self.annotation = self._load_annotation()
         self.data_dict = self.load_data()
 
         self.train_transform = Compose(
@@ -41,6 +49,42 @@ class MRIDataset(monai.data.Dataset):     #train/test
                 ToTensord(keys=("t2","dwi","in_","out_","pre","ap","pvp","dp"))
             ])
         
+
+    def _load_annotation(self):
+        dataset_root = Path(self.data_dir).resolve().parent
+        annotation_path = dataset_root / "labels" / "Annotation.json"
+        if not annotation_path.exists():
+            return {}
+        with annotation_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload.get("Annotation_info", {})
+
+    def _resolve_phase_path(self, patient_id, phase_name, fallback_name):
+        # Preferred path for LLD-MMRI public data: UID-based file names from Annotation.json.
+        if patient_id in self.annotation:
+            for item in self.annotation[patient_id]:
+                if item.get("phase") != phase_name:
+                    continue
+                study_uid = item.get("studyUID", "")
+                series_uid = item.get("seriesUID", "")
+                phase_dir = Path(self.data_dir) / patient_id / study_uid
+                exact = phase_dir / f"{series_uid}.nii.gz"
+                if exact.exists():
+                    return str(exact)
+                candidates = sorted(phase_dir.glob(f"{series_uid}*.nii.gz"))
+                if candidates:
+                    return str(candidates[0])
+
+        # Fallback path used by older preprocessed private data.
+        fallback = Path(self.data_dir) / patient_id / f"{fallback_name}.nii.gz"
+        if fallback.exists():
+            return str(fallback)
+
+        raise FileNotFoundError(
+            f"Cannot resolve file for patient={patient_id}, phase={phase_name}, "
+            f"checked Annotation.json mapping and fallback path={fallback}"
+        )
+
  
     def load_data(self):
       
@@ -55,7 +99,7 @@ class MRIDataset(monai.data.Dataset):     #train/test
         self.labellst = []
         phase_list = ['T2WI', 'DWI', 'In Phase', 'Out Phase', 'C-pre', 'C+A', 'C+V', 'C+Delay']
 
-        csvFile=open(self.csv_path,encoding='utf-8')
+        csvFile=open(self.csv_path,encoding='utf-8-sig')
         lines=csvFile.readlines()   #lines[0] = patient_ID,dataset,AP,pre,PVP,0-1,0-2
         for i in range(1,len(lines)):
             s=lines[i]
@@ -66,14 +110,16 @@ class MRIDataset(monai.data.Dataset):     #train/test
 
             if patient_flag == str(self.flag):
 
-                t2pathlst.append(f'{self.data_dir}/{patient_inf[0]}/T2WI.nii.gz')
-                dwipathlst.append(f'{self.data_dir}/{patient_inf[0]}/DWI.nii.gz')
-                in_pathlst.append(f'{self.data_dir}/{patient_inf[0]}/In Phase.nii.gz')
-                out_pathlst.append(f'{self.data_dir}/{patient_inf[0]}/Out Phase.nii.gz')
-                prepathlst.append(f'{self.data_dir}/{patient_inf[0]}/C-pre.nii.gz')
-                apathlst.append(f'{self.data_dir}/{patient_inf[0]}/C+A.nii.gz')
-                pvpathlst.append(f'{self.data_dir}/{patient_inf[0]}/C+Delay.nii.gz')
-                dpathlst.append(f'{self.data_dir}/{patient_inf[0]}/C+V.nii.gz')
+                patient_id = patient_inf[0]
+                t2pathlst.append(self._resolve_phase_path(patient_id, "T2WI", "T2WI"))
+                dwipathlst.append(self._resolve_phase_path(patient_id, "DWI", "DWI"))
+                in_pathlst.append(self._resolve_phase_path(patient_id, "In Phase", "In Phase"))
+                out_pathlst.append(self._resolve_phase_path(patient_id, "Out Phase", "Out Phase"))
+                prepathlst.append(self._resolve_phase_path(patient_id, "C-pre", "C-pre"))
+                apathlst.append(self._resolve_phase_path(patient_id, "C+A", "C+A"))
+                # Keep original code's channel order for compatibility.
+                pvpathlst.append(self._resolve_phase_path(patient_id, "C+Delay", "C+Delay"))
+                dpathlst.append(self._resolve_phase_path(patient_id, "C+V", "C+V"))
 
                 self.labellst.append(int(patient_inf[2]))
 

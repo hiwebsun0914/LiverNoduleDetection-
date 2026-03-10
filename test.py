@@ -75,8 +75,8 @@ def str_to_bool(value):
 #######################loss-based attention(P/R weight)################
 def rampup(global_step, rampup_length=24):
     if global_step <rampup_length:
-        global_step = np.float(global_step)
-        rampup_length = np.float(rampup_length)
+        global_step = float(global_step)
+        rampup_length = float(rampup_length)
         phase = 1.0 - np.maximum(0.0, global_step) / rampup_length
     else:
         phase = 0.0
@@ -321,7 +321,7 @@ if __name__ == '__main__':
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if torch.is_tensor(v):
-                        state[k] = v.cuda()
+                        state[k] = v.to(device_now)
             best_f1 = checkpoint['best_f1']
             best_acc = checkpoint['best_acc']
             model.eval()
@@ -348,7 +348,7 @@ if __name__ == '__main__':
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if torch.is_tensor(v):
-                        state[k] = v.cuda()
+                        state[k] = v.to(device_now)
             best_f1 = checkpoint['best_f1']
             best_acc = checkpoint['best_acc']
             model.eval()
@@ -375,7 +375,7 @@ if __name__ == '__main__':
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if torch.is_tensor(v):
-                        state[k] = v.cuda()
+                        state[k] = v.to(device_now)
             best_f1 = checkpoint['best_f1']
             best_acc = checkpoint['best_acc']
             model.eval()
@@ -400,7 +400,7 @@ if __name__ == '__main__':
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if torch.is_tensor(v):
-                        state[k] = v.cuda()
+                        state[k] = v.to(device_now)
             best_f1 = checkpoint['best_f1']
             best_acc = checkpoint['best_acc']
             model.eval()
@@ -424,7 +424,7 @@ if __name__ == '__main__':
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if torch.is_tensor(v):
-                        state[k] = v.cuda()
+                        state[k] = v.to(device_now)
             best_f1 = checkpoint['best_f1']
             best_acc = checkpoint['best_acc']
             model.eval()
@@ -448,7 +448,7 @@ if __name__ == '__main__':
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if torch.is_tensor(v):
-                        state[k] = v.cuda()
+                        state[k] = v.to(device_now)
             best_f1 = checkpoint['best_f1']
             best_acc = checkpoint['best_acc']
             model.eval()
@@ -472,7 +472,7 @@ if __name__ == '__main__':
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if torch.is_tensor(v):
-                        state[k] = v.cuda()
+                        state[k] = v.to(device_now)
             best_f1 = checkpoint['best_f1']
             best_acc = checkpoint['best_acc']
             model.eval()
@@ -495,7 +495,7 @@ if __name__ == '__main__':
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if torch.is_tensor(v):
-                        state[k] = v.cuda()
+                        state[k] = v.to(device_now)
             best_f1 = checkpoint['best_f1']
             best_acc = checkpoint['best_acc']
             model.eval()
@@ -520,7 +520,7 @@ if __name__ == '__main__':
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if torch.is_tensor(v):
-                        state[k] = v.cuda()
+                        state[k] = v.to(device_now)
             best_f1 = checkpoint['best_f1']
             best_acc = checkpoint['best_acc']
             model.eval()
@@ -545,7 +545,7 @@ if __name__ == '__main__':
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if torch.is_tensor(v):
-                        state[k] = v.cuda()
+                        state[k] = v.to(device_now)
             best_f1 = checkpoint['best_f1']
             best_acc = checkpoint['best_acc']
             model.eval()

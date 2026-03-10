@@ -34,22 +34,25 @@ class MultiCEFocalLoss(torch.nn.Module):
     def __init__(self, class_num, gamma=2, alpha=None, reduction='mean',device_now = "cuda: 0"):
         super(MultiCEFocalLoss, self).__init__()
         if alpha is None:
-            self.alpha = Variable(torch.ones(class_num, 1))
+            alpha_tensor = torch.ones(class_num, 1, dtype=torch.float32)
         else:
-            self.alpha = alpha
+            alpha_tensor = torch.as_tensor(alpha, dtype=torch.float32)
+            if alpha_tensor.dim() == 1:
+                alpha_tensor = alpha_tensor.view(-1, 1)
+        self.register_buffer("alpha", alpha_tensor)
         self.gamma = gamma
         self.reduction = reduction
         self.class_num =  class_num
         self.device_now = device_now
 
     def forward(self, predict, target):
+        target = target.long()
         pt = F.softmax(predict, dim=1)
-        class_mask = F.one_hot(target, self.class_num)
-        ids = target.view(-1, 1) 
-        alpha = self.alpha[ids.data.view(-1)]
-        probs = (pt * class_mask).sum(1).view(-1, 1)
+        class_mask = F.one_hot(target, self.class_num).to(dtype=pt.dtype, device=pt.device)
+        alpha = self.alpha.to(predict.device)[target.view(-1)]
+        probs = (pt * class_mask).sum(1).view(-1, 1).clamp_min(1e-12)
         log_p = probs.log()
-        loss = -alpha.to(self.device_now) * (torch.pow((1 - probs.to(self.device_now)), self.gamma)) * log_p.to(self.device_now)
+        loss = -alpha * (torch.pow((1 - probs), self.gamma)) * log_p
 
         if self.reduction == 'mean':
             loss = loss.mean()
